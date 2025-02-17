@@ -1,223 +1,320 @@
 # main.py
-# %% Импорты
+
+# region Imports & Конфигурация
 from datetime import datetime, timedelta
-from typing import Optional
-import secrets
 import uuid
+from typing import Optional, List
 
-from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi_users import FastAPIUsers, models
-from fastapi_users.authentication import JWTAuthentication
-from fastapi_users.db import SQLAlchemyBaseUserTableUUID, SQLAlchemyUserDatabase
-from pydantic import BaseModel, EmailStr
-from sqlalchemy import Column, String, ForeignKey, DateTime, Boolean, Integer, Text, select #вроде как select правильно импортировал, можно закоммитить
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, Query
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship, Session
+from passlib.context import CryptContext
+import jwt
+from fastapi_mail import ConnectionConfig
+from fastapi import BackgroundTasks, HTTPException
+from fastapi_mail import FastMail, MessageSchema
 
-# %% Конфигурация
-DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/postgres"
-SECRET_KEY = secrets.token_urlsafe(32)
-JWT_LIFETIME_SECONDS = 3600
+HOST_DOMAIN='127.0.0.1:8000'
+MAIL_USERNAME='tenpenni@mail.ru'
+MAIL_PASSWORD='1d1itC4VwEn1XzXF61sA'
+MAIL_FROM='tenpenni@mail.ru'
+MAIL_PORT=465
+MAIL_SERVER='smtp.mail.ru'
+MAIL_TLS=True
+MAIL_SSL=False
+TEMPLATE_FOLDER='./templates'
+# region Mail
+conf = ConnectionConfig(
+    MAIL_USERNAME=MAIL_USERNAME,
+    MAIL_PASSWORD=MAIL_PASSWORD,
+    MAIL_FROM=MAIL_FROM,
+    MAIL_PORT=MAIL_PORT,
+    MAIL_SERVER=MAIL_SERVER,
+    MAIL_SSL_TLS=True,
+    MAIL_STARTTLS=False,
+    TEMPLATE_FOLDER=TEMPLATE_FOLDER
+)
 
-# %% Модели
+async def send_verification_email(email_to: str, token: str):
+    verification_url = f"http://{HOST_DOMAIN}/confirm-email?token={token}"
+    message = MessageSchema(
+        subject="Подтверждение email",
+        recipients=[email_to],
+        template_body={"verification_url": verification_url},
+        subtype="html"
+    )
+    
+    fm = FastMail(conf)
+    await fm.send_message(message, template_name='verification_email.html')
+# endregion
+
+# --- Конфигурация БД ---
+DB_USER = "your_user"
+DB_PASSWORD = "your_password"
+DB_HOST = "localhost"
+DB_PORT = "5432"
+DB_NAME = "your_database"
+DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+# --- Конфигурация JWT ---
+JWT_SECRET = "your_jwt_secret_key"
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+EMAIL_CONFIRMATION_EXPIRE_MINUTES = 60  # токен для подтверждения email
+
+# OAuth2 схема
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+
+# Пароль хеширование
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# endregion
+
+# region DB
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-class User(SQLAlchemyBaseUserTableUUID, Base):
-    referred_by = Column(String, ForeignKey("user.id"), nullable=True)
-    referrals = relationship("User", backref="referrer", remote_side="id")
-    referral_codes = relationship("ReferralCode", back_populates="user")
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+# endregion
+
+# region Models
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    is_active = Column(Boolean, default=True)
+    is_confirmed = Column(Boolean, default=False)
+    # Для реферальной регистрации: указываем, кто пригласил пользователя
+    referred_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    
+    # Реферальный код, созданный пользователем (один активный код)
+    referral_code = relationship("ReferralCode", back_populates="owner", uselist=False)
+    # Пользователи, которые зарегистрировались по реферальной ссылке этого пользователя
+    referrals = relationship("User", backref="referrer", remote_side=[id])
 
 class ReferralCode(Base):
     __tablename__ = "referral_codes"
-    
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    code = Column(String(36), unique=True, index=True)
-    user_id = Column(String, ForeignKey("user.id"))
-    expires_at = Column(DateTime)
-    is_active = Column(Boolean, default=True)
-    
-    user = relationship("User", back_populates="referral_codes")
 
-# %% Настройка базы данных
-engine = create_async_engine(DATABASE_URL)
-async_session_maker = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    id = Column(Integer, primary_key=True, index=True)
+    code = Column(String, unique=True, index=True, nullable=False)
+    expiration_date = Column(DateTime, nullable=False)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
-async def create_db_and_tables():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    owner = relationship("User", back_populates="referral_code")
+# endregion
 
-# %% Схемы
-class UserCreate(models.BaseUserCreate):
-    referral_code: Optional[str] = None
+# region Schemas (Pydantic модели)
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    referral_code: Optional[str] = None  # код, по которому пользователь зарегистрировался
 
-class UserRead(models.BaseUser[uuid.UUID]):
-    referred_by: Optional[uuid.UUID] = None
+class UserOut(BaseModel):
+    id: int
+    email: EmailStr
+    is_active: bool
+    is_confirmed: bool
+    referred_by: Optional[int] = None
 
-class UserUpdate(models.BaseUserUpdate):
-    pass
+    class Config:
+        from_attributes = True
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    user_id: Optional[int] = None
 
 class ReferralCodeCreate(BaseModel):
-    days_valid: int
+    expiration_date: datetime = Field(..., description="Дата и время истечения кода (UTC)")
 
-class ReferralCodeResponse(BaseModel):
+class ReferralCodeOut(BaseModel):
     code: str
-    expires_at: datetime
-    is_active: bool
+    expiration_date: datetime
 
-# %% Настройка аутентификации
-jwt_authentication = JWTAuthentication(
-    secret=SECRET_KEY,
-    lifetime_seconds=JWT_LIFETIME_SECONDS,
-    tokenUrl="auth/jwt/login"
-)
+    class Config:
+        from_attributes = True
+# endregion
 
-# %% FastAPI Users setup
-async def get_user_db(session: AsyncSession = Depends(async_session_maker)):
-    yield SQLAlchemyUserDatabase(session, User)
+# region Utils: password hashing и токены
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
 
-fastapi_users = FastAPIUsers(
-    get_user_db,
-    [jwt_authentication],
-    User,
-    UserCreate,
-    UserUpdate,
-    UserRead,
-)
+def get_password_hash(password):
+    return pwd_context.hash(password)
 
-# %% Роутеры
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta if expires_delta else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+def create_email_confirmation_token(user_email: str):
+    expire = datetime.utcnow() + timedelta(minutes=EMAIL_CONFIRMATION_EXPIRE_MINUTES)
+    data = {"sub": user_email, "exp": expire}
+    return jwt.encode(data, JWT_SECRET, algorithm=JWT_ALGORITHM)
+# endregion
+
+# region Authentication Dependencies
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Не удалось проверить учетные данные",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id: int = payload.get("user_id")
+        if user_id is None:
+            raise credentials_exception
+        token_data = TokenData(user_id=user_id)
+    except jwt.PyJWTError:
+        raise credentials_exception
+    user = db.query(User).filter(User.id == token_data.user_id).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+def get_current_active_user(current_user: User = Depends(get_current_user)):
+    if not current_user.is_active:
+        raise HTTPException(status_code=400, detail="Неактивный пользователь")
+    return current_user
+# endregion
+
+# region FastAPI app и endpoints
 app = FastAPI(title="Referral System API")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+# --- Создание БД ---
 @app.on_event("startup")
-async def startup():
-    await create_db_and_tables()
+def on_startup():
+    Base.metadata.create_all(bind=engine)
 
-# Аутентификация
-app.include_router(
-    fastapi_users.get_auth_router(jwt_authentication),
-    prefix="/auth/jwt",
-    tags=["auth"],
-)
+# Регистрация пользователя с подтверждением email
+@app.post("/register", response_model=UserOut)
+def register(user_in: UserCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    # Проверка, существует ли уже пользователь с таким email
+    if db.query(User).filter(User.email == user_in.email).first():
+        raise HTTPException(status_code=400, detail="Пользователь с таким email уже существует")
+    
+    # Если указан реферальный код, проверяем его валидность
+    referred_by_id = None
+    if user_in.referral_code:
+        referral = db.query(ReferralCode).filter(ReferralCode.code == user_in.referral_code).first()
+        if not referral:
+            raise HTTPException(status_code=400, detail="Неверный реферальный код")
+        if referral.expiration_date < datetime.utcnow():
+            raise HTTPException(status_code=400, detail="Реферальный код истёк")
+        referred_by_id = referral.owner_id
 
-app.include_router(
-    fastapi_users.get_register_router(UserRead, UserCreate),
-    prefix="/auth",
-    tags=["auth"],
-)
-
-# Реферальные эндпоинты
-@app.post("/referral-codes/", response_model=ReferralCodeResponse, tags=["referral"])
-async def create_referral_code(
-    data: ReferralCodeCreate,
-    user: User = Depends(fastapi_users.current_user(active=True)),
-    session: AsyncSession = Depends(async_session_maker)
-):
-    # Проверка существующего активного кода
-    existing_code = await session.execute(
-        select(ReferralCode).where(
-            (ReferralCode.user_id == str(user.id)) &
-            (ReferralCode.is_active == True)
-        )
+    hashed_password = get_password_hash(user_in.password)
+    new_user = User(
+        email=user_in.email,
+        hashed_password=hashed_password,
+        is_active=True,
+        is_confirmed=False,
+        referred_by=referred_by_id,
     )
-    if existing_code.scalar():
-        raise HTTPException(
-            status_code=400,
-            detail="Active referral code already exists"
-        )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
 
-    # Генерация нового кода
-    code = secrets.token_urlsafe(16)
-    expires_at = datetime.utcnow() + timedelta(days=data.days_valid)
-    
-    new_code = ReferralCode(
-        code=code,
-        user_id=str(user.id),
-        expires_at=expires_at
-    )
-    
-    session.add(new_code)
-    await session.commit()
-    return new_code
+    # Создаем токен подтверждения email и имитируем отправку письма (например, через background task)
+    email_token = create_email_confirmation_token(new_user.email)
+    # confirmation_link = f"http://localhost:8000/confirm-email?token={email_token}"
+    # Здесь можно добавить отправку письма, пока что просто выводим ссылку в консоль
+    background_tasks.add_task(send_verification_email, new_user.email, email_token)
 
-@app.delete("/referral-codes/{code_id}", tags=["referral"])
-async def delete_referral_code(
-    code_id: str,
-    user: User = Depends(fastapi_users.current_user(active=True)),
-    session: AsyncSession = Depends(async_session_maker)
-):
-    code = await session.get(ReferralCode, code_id)
-    if not code or code.user_id != str(user.id):
-        raise HTTPException(status_code=404, detail="Code not found")
-    
-    code.is_active = False
-    await session.commit()
-    return {"status": "success"}
+    return new_user
 
-@app.get("/referral-code/{email}", response_model=ReferralCodeResponse, tags=["referral"])
-async def get_referral_code_by_email(
-    email: EmailStr,
-    session: AsyncSession = Depends(async_session_maker)
-):
-    user = await session.execute(select(User).where(User.email == email))
-    user = user.scalar()
+# Подтверждение email
+@app.get("/confirm-email")
+def confirm_email(token: str, db: Session = Depends(get_db)):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_email: str = payload.get("sub")
+        if user_email is None:
+            raise HTTPException(status_code=400, detail="Неверный токен")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=400, detail="Неверный или просроченный токен")
+    
+    user = db.query(User).filter(User.email == user_email).first()
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    user.is_confirmed = True
+    db.commit()
+    return {"message": "Email успешно подтвержден"}
+
+# Аутентификация: получение JWT токена
+@app.post("/token", response_model=Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="Неверный email или пароль")
+    access_token = create_access_token(data={"user_id": user.id})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# Создание реферального кода (аутентифицированный пользователь)
+@app.post("/referral", response_model=ReferralCodeOut)
+def create_referral_code(ref_data: ReferralCodeCreate, current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
+    # Проверка: если пользователь уже имеет активный код, выдаем ошибку
+    existing_code = db.query(ReferralCode).filter(ReferralCode.owner_id == current_user.id).first()
+    if existing_code:
+        raise HTTPException(status_code=400, detail="У вас уже есть активный реферальный код")
     
-    code = await session.execute(
-        select(ReferralCode).where(
-            (ReferralCode.user_id == str(user.id)) &
-            (ReferralCode.is_active == True)
-        )
+    # Генерация уникального кода (например, UUID)
+    code_str = str(uuid.uuid4())
+    referral = ReferralCode(
+        code=code_str,
+        expiration_date=ref_data.expiration_date,
+        owner_id=current_user.id,
     )
-    code = code.scalar()
-    if not code:
-        raise HTTPException(status_code=404, detail="Active code not found")
-    
-    return code
+    db.add(referral)
+    db.commit()
+    db.refresh(referral)
+    return referral
 
-@app.get("/users/{user_id}/referrals", tags=["referral"])
-async def get_referrals(
-    user_id: uuid.UUID,
-    session: AsyncSession = Depends(async_session_maker)
-):
-    referrals = await session.execute(
-        select(User).where(User.referred_by == str(user_id))
-    )
-    return referrals.scalars().all()
+# Удаление реферального кода
+@app.delete("/referral", status_code=204)
+def delete_referral_code(current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
+    referral = db.query(ReferralCode).filter(ReferralCode.owner_id == current_user.id).first()
+    if not referral:
+        raise HTTPException(status_code=404, detail="Реферальный код не найден")
+    db.delete(referral)
+    db.commit()
+    return
 
-# Регистрация с реферальным кодом
-@app.post("/register-with-referral", tags=["auth"])
-async def register_with_referral(
-    user_create: UserCreate,
-    session: AsyncSession = Depends(async_session_maker)
-):
-    if user_create.referral_code:
-        referral_code = await session.execute(
-            select(ReferralCode).where(
-                (ReferralCode.code == user_create.referral_code) &
-                (ReferralCode.is_active == True) &
-                (ReferralCode.expires_at >= datetime.utcnow())
-            )
-        )
-        referral_code = referral_code.scalar()
-        if not referral_code:
-            raise HTTPException(status_code=400, detail="Invalid referral code")
-        
-        user_create.referred_by = referral_code.user_id
-    
-    user_db = SQLAlchemyUserDatabase(session, User)
-    return await user_db.create(await user_db.validate(user_create))
+# Получение реферального кода по email адресу реферера
+@app.get("/referral/by-email", response_model=ReferralCodeOut)
+def get_referral_by_email(email: EmailStr = Query(...), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    referral = db.query(ReferralCode).filter(ReferralCode.owner_id == user.id).first()
+    if not referral:
+        raise HTTPException(status_code=404, detail="Реферальный код не найден")
+    return referral
 
-# %% Запуск
+# Получение информации о рефералах по id реферера
+@app.get("/referrals/{referrer_id}", response_model=List[UserOut])
+def get_referrals(referrer_id: int, db: Session = Depends(get_db)):
+    referrals = db.query(User).filter(User.referred_by == referrer_id).all()
+    return referrals
+# endregion
+
+# region Main запуск
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+# endregion
