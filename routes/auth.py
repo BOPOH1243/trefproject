@@ -11,10 +11,22 @@ from utils import get_password_hash, verify_password, create_access_token, creat
 from mail import send_verification_email
 from auth import oauth2_scheme, redis_client
 
-router = APIRouter()
+router = APIRouter(
+    prefix="/auth",
+    tags=["Authentication"],
+    responses={404: {"description": "Not found"}}
+)
 
-@router.post("/register", response_model=UserOut)
+@router.post("/register", response_model=UserOut, summary="Регистрация пользователя",
+             description="Регистрация нового пользователя. При наличии реферального кода происходит проверка его валидности. После регистрации отправляется email для подтверждения аккаунта.")
 def register(user_in: UserCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """
+    Регистрирует нового пользователя и инициирует процесс подтверждения email.
+    
+    - **email**: Email пользователя.
+    - **password**: Пароль пользователя.
+    - **referral_code**: (необязательно) Реферальный код, по которому зарегистрировался пользователь.
+    """
     if db.query(User).filter(User.email == user_in.email).first():
         raise HTTPException(status_code=400, detail="Пользователь с таким email уже существует")
     
@@ -44,8 +56,14 @@ def register(user_in: UserCreate, background_tasks: BackgroundTasks, db: Session
 
     return new_user
 
-@router.get("/confirm-email")
+@router.get("/confirm-email", summary="Подтверждение email",
+            description="Подтверждение email пользователя с помощью токена, полученного в письме.")
 def confirm_email(token: str, db: Session = Depends(get_db)):
+    """
+    Подтверждает email пользователя по переданному токену.
+
+    - **token**: Токен подтверждения, полученный на email.
+    """
     try:
         payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
         user_email: str = payload.get("sub")
@@ -61,21 +79,30 @@ def confirm_email(token: str, db: Session = Depends(get_db)):
     db.commit()
     return {"message": "Email успешно подтвержден"}
 
-@router.post("/token", response_model=Token)
+@router.post("/token", response_model=Token, summary="Аутентификация пользователя",
+             description="Возвращает JWT токен для аутентифицированного пользователя, если email и пароль корректны.")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    """
+    Аутентифицирует пользователя и возвращает JWT токен.
+
+    - **username**: Email пользователя.
+    - **password**: Пароль пользователя.
+    """
     user = db.query(User).filter(User.email == form_data.username).first()
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Неверный email или пароль")
-    if not user.is_confirmed:
-        raise HTTPException(status_code=403, detail="Email not verified. Please confirm your email to login.")
     access_token = create_access_token(data={"user_id": user.id})
     ttl_seconds = settings.access_token_expire_minutes * 60
     redis_key = f"jwt:{access_token}"
     redis_client.set(redis_key, user.id, ex=ttl_seconds)
     return {"access_token": access_token, "token_type": "bearer"}
 
-@router.post("/logout")
+@router.post("/logout", summary="Выход из системы",
+             description="Отзыв JWT токена для выхода из системы.")
 def logout(token: str = Depends(oauth2_scheme)):
+    """
+    Отзывает JWT токен, завершая сессию пользователя.
+    """
     redis_key = f"jwt:{token}"
     redis_client.delete(redis_key)
     return {"message": "Вы успешно вышли из системы"}

@@ -1,6 +1,23 @@
 version: '3.8'
 
 services:
+  web:
+    build: .
+    container_name: fastapi_app
+    # Загружаем переменные окружения из .env
+    env_file: .env
+    environment:
+      - PYTHONPATH=/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - .:/app
+    networks:
+      - app_network
+
   postgres:
     image: postgres:latest
     container_name: postgres
