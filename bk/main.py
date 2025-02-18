@@ -14,9 +14,8 @@ from sqlalchemy.orm import sessionmaker, relationship, Session
 from passlib.context import CryptContext
 import jwt
 from fastapi_mail import ConnectionConfig
+from fastapi import BackgroundTasks, HTTPException
 from fastapi_mail import FastMail, MessageSchema
-
-import redis  # импорт для работы с Redis
 
 HOST_DOMAIN='127.0.0.1:8000'
 MAIL_USERNAME='tenpenni@mail.ru'
@@ -42,12 +41,6 @@ JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 EMAIL_CONFIRMATION_EXPIRE_MINUTES = 60  # токен для подтверждения email
 
-# --- Конфигурация Redis ---
-# Если запускаете в Docker, возможно, нужно указать имя контейнера, например, "redis"
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
-REDIS_DB = 0
-redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
 
 # region Mail
 conf = ConnectionConfig(
@@ -178,14 +171,6 @@ def create_email_confirmation_token(user_email: str):
 
 # region Authentication Dependencies
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
-    # Проверка наличия токена в Redis
-    redis_key = f"jwt:{token}"
-    if not redis_client.exists(redis_key):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Токен недействителен или отозван",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Не удалось проверить учетные данные",
@@ -249,6 +234,8 @@ def register(user_in: UserCreate, background_tasks: BackgroundTasks, db: Session
 
     # Создаем токен подтверждения email и имитируем отправку письма (например, через background task)
     email_token = create_email_confirmation_token(new_user.email)
+    # confirmation_link = f"http://localhost:8000/confirm-email?token={email_token}"
+    # Здесь можно добавить отправку письма, пока что просто выводим ссылку в консоль
     background_tasks.add_task(send_verification_email, new_user.email, email_token)
 
     return new_user
@@ -278,18 +265,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Неверный email или пароль")
     access_token = create_access_token(data={"user_id": user.id})
-    # Сохраняем токен в Redis с TTL, равным времени жизни токена
-    ttl_seconds = ACCESS_TOKEN_EXPIRE_MINUTES * 60
-    redis_key = f"jwt:{access_token}"
-    redis_client.set(redis_key, user.id, ex=ttl_seconds)
     return {"access_token": access_token, "token_type": "bearer"}
-
-# Эндпоинт для logout (отзыва токена)
-@app.post("/logout")
-def logout(token: str = Depends(oauth2_scheme)):
-    redis_key = f"jwt:{token}"
-    redis_client.delete(redis_key)
-    return {"message": "Вы успешно вышли из системы"}
 
 # Создание реферального кода (аутентифицированный пользователь)
 @app.post("/referral", response_model=ReferralCodeOut)
